@@ -40,6 +40,13 @@ import GHC.Prim
 #define SIZEOF_HSINT  INT_SIZE_IN_BYTES
 #endif
 
+-- We try to avoid false sharing by padding the Int we modify with two x86-size
+-- cache line sizes, so that no matter how it's aligned the counter will always
+-- take up an entire cache line.
+sIZEOF_2CACHELINES, cACHELINE_PADDED_IX :: Int
+sIZEOF_2CACHELINES = 128 -- bytes
+cACHELINE_PADDED_IX = 64 `quot` SIZEOF_HSINT
+
 -- | The type of mutable atomic counters.
 data AtomicCounter = AtomicCounter (MutableByteArray# RealWorld)
 
@@ -62,21 +69,23 @@ newRawCounter :: IO AtomicCounter
 newRawCounter = IO $ \s ->
   case newByteArray# size s of { (# s, arr #) ->
   (# s, AtomicCounter arr #) }
-  where !(I# size) = SIZEOF_HSINT
+  where !(I# size) = sIZEOF_2CACHELINES
 
 {-# INLINE readCounter #-}
 -- | Equivalent to `readCounterForCAS` followed by `peekCTicket`.        
 readCounter :: AtomicCounter -> IO Int
 readCounter (AtomicCounter arr) = IO $ \s ->
-  case readIntArray# arr 0# s of { (# s, i #) ->
+  case readIntArray# arr ix s of { (# s, i #) ->
   (# s, I# i #) }
+  where !(I# ix) = cACHELINE_PADDED_IX
 
 {-# INLINE writeCounter #-}
 -- | Make a non-atomic write to the counter.  No memory-barrier.
 writeCounter :: AtomicCounter -> Int -> IO ()
 writeCounter (AtomicCounter arr) (I# i) = IO $ \s ->
-  case writeIntArray# arr 0# i s of { s ->
+  case writeIntArray# arr ix i s of { s ->
   (# s, () #) }
+  where !(I# ix) = cACHELINE_PADDED_IX
 
 {-# INLINE readCounterForCAS #-}
 -- | Just like the "Data.Atomics" CAS interface, this routine returns an opaque
@@ -99,10 +108,11 @@ peekCTicket !x = x
 casCounter :: AtomicCounter -> CTicket -> Int -> IO (Bool, CTicket)
 -- casCounter (AtomicCounter barr) !old !new =
 casCounter (AtomicCounter mba#) (I# old#) newBox@(I# new#) = IO$ \s1# ->
-  let (# s2#, res# #) = casIntArray# mba# 0# old# new# s1# in
+  let (# s2#, res# #) = casIntArray# mba# ix old# new# s1# in
   case res# ==# old# of 
     False -> (# s2#, (False, I# res# ) #) -- Failure
     True  -> (# s2#, (True , newBox ) #) -- Success
+  where !(I# ix) = cACHELINE_PADDED_IX
 
 {-# INLINE sameCTicket #-}
 sameCTicket :: CTicket -> CTicket -> Bool
@@ -118,12 +128,14 @@ sameCTicket = (==)
 --   loop like CAS.
 incrCounter :: Int -> AtomicCounter -> IO Int
 incrCounter (I# incr#) (AtomicCounter mba#) = IO $ \ s1# -> 
-  let (# s2#, res #) = fetchAddIntArray# mba# 0# incr# s1# in
+  let (# s2#, res #) = fetchAddIntArray# mba# ix incr# s1# in
   (# s2#, (I# res) #)
+  where !(I# ix) = cACHELINE_PADDED_IX
 
 {-# INLINE incrCounter_ #-}
 -- | An alternate version for when you don't care about the old value.
 incrCounter_ :: Int -> AtomicCounter -> IO ()
 incrCounter_ (I# incr#) (AtomicCounter mba#) = IO $ \ s1# -> 
-  let (# s2#, res #) = fetchAddIntArray# mba# 0# incr# s1# in
+  let (# s2#, res #) = fetchAddIntArray# mba# ix incr# s1# in
   (# s2#, () #)
+  where !(I# ix) = cACHELINE_PADDED_IX
